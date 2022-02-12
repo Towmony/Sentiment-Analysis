@@ -1,0 +1,183 @@
+import torch
+import torch.nn as nn
+import torch.nn.utils.rnn as rnn
+import torch.optim as optim
+
+from collections import Counter
+import numpy as np
+import torch.nn.functional as F
+import os, time, csv, nltk
+from pathlib import Path  
+from string import punctuation
+from torch.nn import Conv1d
+
+
+from torch.utils import data
+from torch.utils.data import Dataset, DataLoader
+
+device = 'cpu' #modify based on machine i.e cuda/cpu
+
+class CNN(nn.Module):
+    
+    def __init__(self, emb_dim=300, n_filters = 100, filter_sizes = [3, 4, 5], 
+                 output_dim=2,dropout = 0.5, pad_idx=0, input_dim=83829):
+        super().__init__()
+        self.embedding = nn.Embedding(input_dim, emb_dim,padding_idx=pad_idx) 
+
+        self.convs = nn.ModuleList([nn.Conv1d(in_channels = emb_dim,
+                                              out_channels = n_filters,
+                                              kernel_size = filter_size)
+                                    for filter_size in filter_sizes])
+    
+        self.fc = nn.Linear(len(filter_sizes) * n_filters, output_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, text):# text = [batch size, seq len]
+
+        embedded = self.dropout(self.embedding(text))       # embedded = [batch size, seq len, emb dim]
+        embedded = embedded.permute(0, 2, 1)       # embedded = [batch size, emb dim, seq len]
+        conved = [F.relu(conv(embedded)) for conv in self.convs]# conved[n] = [batch size, n filters, seq len - filter_sizes[n] + 1]
+        pooled = [F.max_pool1d(conv, conv.shape[-1]).squeeze(-1) for conv in conved]     # pooled[n] = [batch size, n filters]
+        cat = torch.cat(pooled, dim = -1)       # cat = [batch size, n filters * len(filter_sizes)]
+        prediction = self.fc(self.dropout(cat))      # prediction = [batch size, output dim]
+        prediction = torch.sigmoid(prediction)
+        #alert sigmoid added to make sure the prediction is between 0 and 1 
+        return prediction
+        
+
+
+#loading given dataset
+        
+class Load_Dataset(Dataset):
+    def __init__(self, dataset, lengths, labels, words2index):
+        self.dataset = dataset
+        self.lengths = lengths
+        self.labels = labels
+        max_length = np.max(lengths) # max length
+        dataset_zeros = torch.tensor(np.zeros(max_length, dtype="long"),dtype = torch.long)
+        
+        for i, l in enumerate(lengths):
+            words_index = [words2index.get(w.lower(),words2index['<ukn>']) for w in nltk.wordpunct_tokenize(self.dataset[i])]
+            dataset_tensor = torch.tensor(words_index,dtype=torch.long, device= device)
+            padded_dataset_tensor = F.pad(dataset_tensor,(max_length - dataset_tensor.size(0),0))
+            self.dataset[i] = padded_dataset_tensor.data # for each sentence assign its vocab according to its length 
+
+    def __getitem__(self, idx):
+         return self.dataset[idx],self.labels[idx]
+
+    def __len__(self):
+        return len(self.dataset)
+        
+        
+###getting the dataset to work on       
+def get_cnn_dataset(path : str, optional_file : str = None, Training_Data = True):
+    vocab = Counter()
+    labels = []
+    lengths = []
+    dataset = [] 
+    
+    for label in os.listdir(path):
+        label_folder = os.path.join(path, label)
+
+        #alert the below block of code aims to make the target variable of size 2
+        # to convert label 1 to [0,1], label 0 to [1,0] for TRAINING ONLY
+        if int(label) ==1:
+            label_2d = [0,1]
+        else:
+            label_2d = [1,0]
+        if not Training_Data:
+            label_2d = int(label)
+            
+        for sent_file_name in os.listdir(label_folder):
+            sent_filepath = str(os.path.join(label_folder, sent_file_name))
+                
+            with open(sent_filepath, 'r', encoding="utf8") as sent_file:
+                sent = sent_file.read()
+                dataset.append(sent)
+                labels.append(torch.tensor(label_2d,dtype=torch.long))
+                lengths.append(len(nltk.wordpunct_tokenize(sent))) # lenghts for each sentence
+                for word in nltk.wordpunct_tokenize(sent):
+                    vocab[word.lower()] = 1
+
+    global words2index 
+    global vocab_len_var
+    if Training_Data:
+        words2index = {word: i for i, word in enumerate(vocab)}
+        words2index['<ukn>'] = len(words2index)
+        get_word2index(vocab,optional_file)
+        
+        vocab_len_var = len(words2index)+1    # for zero padding
+        print("vocab_len_var", vocab_len_var)
+    else:
+        get_word2index(vocab,optional_file)
+        vocab_len_var = len(words2index)+1
+    print("vocab_len_var2", vocab_len_var)
+    dm = Load_Dataset(dataset,lengths,labels,words2index)
+    return dm      # returns CUSTOM pytorch dataset object 
+    
+
+
+###defining dataset 
+def train_cnn(cnn_instance : CNN, dataset, max_train_time : float,epochs = 5, learning_rate=0.001):
+    print(dataset)
+    end_time =time.time() + max_train_time # keep
+    
+    optimizer = optim.Adam(cnn_instance.parameters(),lr=learning_rate)
+
+    while True:
+        for epoch in range(epochs):
+            print(epoch)
+            for sent,label in data.DataLoader(dataset,30, shuffle=True):
+                sent = sent.to(device)
+                out = cnn_instance(sent)
+
+                target = label.to(device, torch.float)
+                loss =  F.binary_cross_entropy(out, target)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                # print("training loss: ",loss.item())
+
+                if time.time() > end_time: # keep in training loop
+                    break
+            if time.time() > end_time: # keep in training loop
+                break
+        if time.time() > end_time: # keep in training loop
+            break
+            
+            
+            
+### evaluating the model 
+from sklearn.metrics import accuracy_score
+def evaluate(clf, test_data):
+    
+    true_labels = []
+    inf_labels = []
+    
+    for data, labels in DataLoader(test_data, batch_size=100):
+        out = clf(data)
+        cls = torch.argmax(F.softmax(out, dim=1), dim=1)
+        
+        inf_labels.extend(cls.detach().numpy().tolist())
+        true_labels.extend(labels.numpy().tolist())
+
+    return accuracy_score(true_labels, inf_labels)      
+
+
+#CNN Model Training using the defined functions above
+#we need first to get the data in order to set the value "vocab_len_var" which shoulb be passed to the model
+
+cnn_dataset = get_cnn_dataset('train','word2index_cr.pkl', True) 
+cnn_inst = CNN(input_dim=vocab_len_var).to(device)
+
+#saving the trained model
+torch.save(cnn_inst.state_dict(), "cnn.pt")# save model after training
+train_cnn(cnn_inst, cnn_dataset, 0.5) 
+
+#CNN Model Evaluation  
+#we need first to get the data in order to set the value "vocab_len_var" which shoulb be passed to the model
+cnn_dataset_test = get_cnn_dataset('test','word2index_cr.pkl' ,Training_Data=False)
+cnn_loaded = CNN(input_dim=vocab_len_var).to(device) 
+cnn_loaded.load_state_dict(torch.load("cnn.pt",map_location=torch.device('cpu'))) 
+cnn_loaded.eval() 
+evaluate(cnn_loaded,cnn_dataset_test)
